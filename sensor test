@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CanSat センサ・無線 接続確認テスト (Raspberry Pi 4 用)
+
+回路図 (CanSat_回路図.svg) に基づき、以下の接続だけを確認する:
+  - I2Cセンサ4点 (SDA=GPIO2/Pin3, SCL=GPIO3/Pin5, 3.3V)
+      IMU  : AE-BNO055-BO  0x28
+      GPS  : SAM-M10Q      0x42
+      ToF  : VL53L1X       0x29
+      気圧 : BME280        0x76 (or 0x77)
+  - 無線 IM920 (UART, TXD=GPIO14/Pin8 -> IM920 RXD, RXD=GPIO15/Pin10 <- IM920 TXD, 3.3V)
+
+駆動系・カメラ(CSI)はこのテストの対象外。
+
+事前準備 (Raspberry Pi OS):
+  1. raspi-config で I2C を有効化
+       sudo raspi-config  ->  Interface Options -> I2C -> Enable
+  2. raspi-config で UART(シリアルポート)を有効化 (ログインシェルは無効、ポートのHWは有効)
+       sudo raspi-config  ->  Interface Options -> Serial Port
+         "login shell over serial?"      -> No
+         "serial port hardware enabled?" -> Yes
+     Bluetoothと物理UARTを共有させたくない場合は /boot/firmware/config.txt に
+       dtoverlay=disable-bt
+     を追記して再起動すると /dev/serial0 が PL011(ttyAMA0) に固定される。
+  3. 必要パッケージ
+       sudo apt update
+       sudo apt install -y python3-smbus2 python3-serial i2c-tools
+       # なければ: pip3 install smbus2 pyserial
+  4. 一度再起動してから実行する
+       sudo reboot
+
+使い方:
+  python3 sensor_wireless_test.py
+  python3 sensor_wireless_test.py --bus 1 --port /dev/serial0 --baud 19200
+"""
+
+import argparse
+import sys
+import time
+
+# ---- 期待される I2C センサ一覧 (回路図より) ----
+EXPECTED_I2C_DEVICES = [
+    (0x28, "IMU  AE-BNO055-BO"),
+    (0x42, "GPS  SAM-M10Q"),
+    (0x29, "ToF  VL53L1X"),
+    (0x76, "気圧 BME280 (0x76)"),
+    (0x77, "気圧 BME280 (0x77・代替アドレス)"),
+]
+
+
+def scan_i2c(bus_num: int):
+    """I2Cバスをフルスキャンし、見つかったアドレスの一覧を返す"""
+    try:
+        from smbus2 import SMBus
+    except ImportError:
+        print("[エラー] smbus2 が見つかりません。 'pip3 install smbus2' でインストールしてください。")
+        sys.exit(1)
+
+    found = []
+    try:
+        bus = SMBus(bus_num)
+    except FileNotFoundError:
+        print(f"[エラー] /dev/i2c-{bus_num} が見つかりません。raspi-configでI2Cを有効化して再起動してください。")
+        sys.exit(1)
+
+    with bus:
+        for addr in range(0x03, 0x78):
+            try:
+                bus.read_byte(addr)
+                found.append(addr)
+            except OSError:
+                pass
+            except Exception:
+                pass
+    return found
+
+
+def test_i2c_sensors(bus_num: int):
+    print("=" * 60)
+    print(f"[1] I2Cセンサ接続確認  (bus /dev/i2c-{bus_num})")
+    print("=" * 60)
+
+    found = scan_i2c(bus_num)
+    if found:
+        hex_list = ", ".join(f"0x{a:02X}" for a in found)
+        print(f"検出されたI2Cアドレス: {hex_list}")
+    else:
+        print("検出されたI2Cアドレス: なし")
+    print()
+
+    results = []
+    bme280_ok = False
+    for addr, name in EXPECTED_I2C_DEVICES:
+        ok = addr in found
+        if addr in (0x76, 0x77) and ok:
+            bme280_ok = True
+        # BME280は0x76/0x77のどちらか片方でOKとして扱う
+        if addr in (0x76, 0x77):
+            continue
+        results.append((name, addr, ok))
+
+    # BME280はまとめて1行表示
+    results.append(("気圧 BME280 (0x76 or 0x77)", None, bme280_ok))
+
+    all_ok = True
+    for name, addr, ok in results:
+        mark = "OK" if ok else "NG"
+        if not ok:
+            all_ok = False
+        addr_str = f"0x{addr:02X}" if addr is not None else "0x76/0x77"
+        print(f"  [{mark}] {name:<32s} ({addr_str})")
+
+    print()
+    if all_ok:
+        print("→ センサ4点すべて検出されました。")
+    else:
+        print("→ 未検出のセンサがあります。配線(SDA/SCL/3.3V/GND)・電源投入・アドレス設定を確認してください。")
+    print()
+    return all_ok
+
+
+def test_im920(port: str, baud: int, timeout: float):
+    print("=" * 60)
+    print(f"[2] 無線 IM920 接続確認  (port={port}, baud={baud})")
+    print("=" * 60)
+
+    try:
+        import serial
+    except ImportError:
+        print("[エラー] pyserial が見つかりません。 'pip3 install pyserial' でインストールしてください。")
+        return False
+
+    try:
+        ser = serial.Serial(port, baudrate=baud, timeout=timeout)
+    except Exception as e:
+        print(f"[エラー] シリアルポートを開けません: {e}")
+        print("→ raspi-configでUARTを有効化し、配線(TXD/RXD/GND/3.3V)を確認してください。")
+        return False
+
+    ok = False
+    with ser:
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+
+        # IM920固有コマンド: RDID = 自局IDを読み出す (ASCII, \r\n終端)
+        cmd = b"RDID\r\n"
+        print(f"送信コマンド: {cmd!r}")
+        ser.write(cmd)
+        ser.flush()
+
+        time.sleep(0.2)
+        resp = ser.read(256)
+
+        if resp:
+            print(f"受信データ  : {resp!r}")
+            try:
+                print(f"受信(ASCII) : {resp.decode('ascii', errors='replace').strip()}")
+            except Exception:
+                pass
+            ok = True
+        else:
+            print("受信データ  : なし (タイムアウト)")
+
+    print()
+    if ok:
+        print("→ IM920から応答がありました。UART接続はOKと判断できます。")
+    else:
+        print("→ 応答がありません。以下を確認してください:")
+        print("   ・TXD/RXDがクロス接続になっているか (Pi TXD -> IM920 RXD, Pi RXD <- IM920 TXD)")
+        print("   ・IM920の電源(3.3V)とGNDが接続されているか")
+        print("   ・raspi-configでシリアルのログインシェルが無効・ハードウェアが有効になっているか")
+        print("   ・ボーレート(デフォルト19200bps)が合っているか")
+    print()
+    return ok
+
+
+def main():
+    parser = argparse.ArgumentParser(description="CanSat センサ・無線 接続確認テスト")
+    parser.add_argument("--bus", type=int, default=1, help="I2Cバス番号 (Raspberry Piは通常1)")
+    parser.add_argument("--port", type=str, default="/dev/serial0", help="IM920が繋がっているシリアルポート")
+    parser.add_argument("--baud", type=int, default=19200, help="IM920のボーレート (デフォルト19200)")
+    parser.add_argument("--timeout", type=float, default=1.0, help="シリアル応答待ちのタイムアウト秒")
+    parser.add_argument("--skip-i2c", action="store_true", help="I2Cセンサテストをスキップ")
+    parser.add_argument("--skip-im920", action="store_true", help="IM920テストをスキップ")
+    args = parser.parse_args()
+
+    print("CanSat センサ・無線 接続確認テスト")
+    print("(駆動系・カメラは対象外。回路図 CanSat_回路図.svg に基づく)\n")
+
+    i2c_ok = True
+    im920_ok = True
+
+    if not args.skip_i2c:
+        i2c_ok = test_i2c_sensors(args.bus)
+
+    if not args.skip_im920:
+        im920_ok = test_im920(args.port, args.baud, args.timeout)
+
+    print("=" * 60)
+    print("結果サマリ")
+    print("=" * 60)
+    if not args.skip_i2c:
+        print(f"  I2Cセンサ : {'OK' if i2c_ok else 'NG'}")
+    if not args.skip_im920:
+        print(f"  IM920無線 : {'OK' if im920_ok else 'NG'}")
+
+    if (args.skip_i2c or i2c_ok) and (args.skip_im920 or im920_ok):
+        sys.exit(0)
+    else:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
