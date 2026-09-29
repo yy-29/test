@@ -66,7 +66,7 @@ class Bme280:
         calib3 = bus.read_i2c_block_data(self.addr, 0xE1, 7)
         (self.dig_T1, self.dig_T2, self.dig_T3, self.dig_P1, self.dig_P2, self.dig_P3,
          self.dig_P4, self.dig_P5, self.dig_P6, self.dig_P7, self.dig_P8, self.dig_P9) = \
-            struct.unpack("<Hhhhhhhhhhhh", bytes(calib1))
+            struct.unpack("<HhhHhhhhhhhh", bytes(calib1))
         self.dig_H1 = calib2[0]
         self.dig_H2, self.dig_H3 = struct.unpack("<hB", bytes(calib3[0:3]))
         e4, e5, e6 = calib3[3], calib3[4], calib3[5]
@@ -179,20 +179,24 @@ class GpsI2c:
         self.last_line = None
 
     def poll(self):
+        # GPSは1Hzで数百byteのNMEAをまとめて吐くため、1回のpollで
+        # 溜まっているぶんを使い切るまで読む(32byteずつしか読めないため)。
+        # 読み残すとモジュール側の内部バッファが溢れ、文字化け(コンマ抜け等)の原因になる。
         bus, addr = self.bus, self.addr
-        avail_h = bus.read_byte_data(addr, 0xFD)
-        avail_l = bus.read_byte_data(addr, 0xFE)
-        n = (avail_h << 8) | avail_l
-        if n <= 0:
-            return
-        data = bus.read_i2c_block_data(addr, 0xFF, min(n, 32))
-        text = bytes(b for b in data if b != 0xFF).decode("ascii", errors="ignore")
-        self.linebuf += text
-        while "\n" in self.linebuf:
-            line, self.linebuf = self.linebuf.split("\n", 1)
-            line = line.strip()
-            if line.startswith("$"):
-                self.last_line = line
+        for _ in range(32):  # 1回のpollで最大32*32=1024byteまで排出
+            avail_h = bus.read_byte_data(addr, 0xFD)
+            avail_l = bus.read_byte_data(addr, 0xFE)
+            n = (avail_h << 8) | avail_l
+            if n <= 0:
+                break
+            data = bus.read_i2c_block_data(addr, 0xFF, min(n, 32))
+            text = bytes(b for b in data if b != 0xFF).decode("ascii", errors="ignore")
+            self.linebuf += text
+            while "\n" in self.linebuf:
+                line, self.linebuf = self.linebuf.split("\n", 1)
+                line = line.strip()
+                if line.startswith("$"):
+                    self.last_line = line
 
     def latest(self):
         return self.last_line
