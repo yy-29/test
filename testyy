@@ -1,0 +1,738 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CanSat センサ試験プログラム  (Raspberry Pi 4 / Raspberry Pi OS Bookworm)
+
+各センサのデータシートの仕様だけを根拠に、ドライバから新規に書いたもの。
+試験は2段階:
+  [静的試験] 机に置いたまま自動で実施 (ID確認・自己診断・ノイズ・重力値など)
+  [動的試験] 指示に従って機体を動かし、センサが正しく応答するかを確認
+             (BNO055: 90°傾ける/90°回す, BME280: 1m持ち上げる, VL53L1X: 距離を変える)
+結果は画面表示と同時に report_YYYYmmdd_HHMMSS.txt に保存する。
+
+対象 (I2C bus 1)
+  BME280   0x77/0x76  気圧・気温・湿度
+  BNO055   0x28       9軸IMU (NDOFフュージョン)
+  VL53L1X  0x29       ToF距離  ※ST公開レジスタ表がないため adafruit ライブラリを使用
+  SAM-M10Q 0x42       GNSS     ※UBXバイナリ(MON-VER / NAV-PVT)をポーリングで取得
+
+準備 (Bookwormはシステムに直接pipできないため venv を使う)
+  sudo raspi-config  → Interface Options → I2C → Enable
+  sudo apt install -y python3-smbus2 i2c-tools
+  python3 -m venv --system-site-packages ~/cansat-venv
+  source ~/cansat-venv/bin/activate
+  pip install adafruit-circuitpython-vl53l1x adafruit-blinka
+
+実行 (毎回 source ~/cansat-venv/bin/activate してから、このファイルのあるフォルダで)
+  python3 cansat_sensor_test.py                 # 全センサ, 静的+動的試験
+  python3 cansat_sensor_test.py --auto          # 静的試験のみ (操作不要)
+  python3 cansat_sensor_test.py --only bno055   # センサを限定 (bme280,bno055,tof,gnss)
+  python3 cansat_sensor_test.py --gnss-timeout 300   # 屋外でFixまで最大300秒待つ
+  python3 cansat_sensor_test.py --monitor --csv log.csv   # 全センサ連続表示+記録
+"""
+
+import argparse
+import csv
+import datetime as dt
+import math
+import struct
+import sys
+import time
+
+from smbus2 import SMBus, i2c_msg
+
+BUS_NO = 1
+G0 = 9.80665
+
+
+# =====================================================================
+# 出力 (画面 + レポートファイル)
+# =====================================================================
+class Report:
+    def __init__(self, path):
+        self.f = open(path, "w", encoding="utf-8") if path else None
+        self.path = path
+        self.summary = []          # (センサ, 項目, 判定)
+
+    def log(self, text=""):
+        print(text)
+        if self.f:
+            self.f.write(text + "\n")
+            self.f.flush()
+
+    def judge(self, sensor, item, ok, detail=""):
+        tag = {True: "[合格]", False: "[不合格]", None: "[参考]"}[ok]
+        self.log(f"  {tag:<6s} {item}: {detail}")
+        self.summary.append((sensor, item, ok))
+
+    def section(self, title):
+        self.log("")
+        self.log("=" * 68)
+        self.log(f" {title}")
+        self.log("=" * 68)
+
+    def close(self):
+        if self.f:
+            self.f.close()
+
+
+def mean(xs):
+    return sum(xs) / len(xs) if xs else float("nan")
+
+
+def sd(xs):
+    if len(xs) < 2:
+        return 0.0
+    m = mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+def ask(rep, msg, auto):
+    """動的試験の操作指示。--auto のときは False を返して試験を飛ばす"""
+    if auto:
+        return False
+    rep.log(f"\n  >>> {msg}")
+    try:
+        s = input("      準備できたら Enter (s + Enter でこの試験を飛ばす): ")
+    except EOFError:
+        return False
+    return s.strip().lower() != "s"
+
+
+# =====================================================================
+# BME280  (Bosch BST-BME280-DS002, 4.2.3 浮動小数点補償式)
+# =====================================================================
+class BME280:
+    REG_ID, REG_RESET = 0xD0, 0xE0
+    REG_CTRL_HUM, REG_STATUS, REG_CTRL_MEAS, REG_CONFIG = 0xF2, 0xF3, 0xF4, 0xF5
+    REG_DATA = 0xF7
+
+    def __init__(self, bus):
+        self.bus = bus
+        self.addr = None
+        for a in (0x77, 0x76):
+            try:
+                if bus.read_byte_data(a, self.REG_ID) == 0x60:
+                    self.addr = a
+                    break
+            except OSError:
+                pass
+        if self.addr is None:
+            raise RuntimeError("chip_id=0x60 のデバイスが 0x77/0x76 にない")
+
+        self.bus.write_byte_data(self.addr, self.REG_RESET, 0xB6)
+        time.sleep(0.005)
+        while self.bus.read_byte_data(self.addr, self.REG_STATUS) & 0x01:  # im_update
+            time.sleep(0.002)
+        self._load_trim()
+        # 屋内ナビ相当の推奨設定 (データシート 3.5.3):
+        # osrs_h=x1, osrs_t=x2, osrs_p=x16, IIR=16, t_sb=0.5ms, normalモード → 約25Hz
+        self.bus.write_byte_data(self.addr, self.REG_CTRL_MEAS, 0x00)       # sleepで設定
+        self.bus.write_byte_data(self.addr, self.REG_CTRL_HUM, 0b001)
+        self.bus.write_byte_data(self.addr, self.REG_CONFIG, (0b000 << 5) | (0b100 << 2))
+        self.bus.write_byte_data(self.addr, self.REG_CTRL_MEAS, (0b010 << 5) | (0b101 << 2) | 0b11)
+        time.sleep(0.5)  # IIRが落ち着くまで
+
+    def _load_trim(self):
+        b = bytes(self.bus.read_i2c_block_data(self.addr, 0x88, 26))
+        self.dig_T = struct.unpack_from("<Hhh", b, 0)
+        self.dig_P = struct.unpack_from("<Hhhhhhhhh", b, 6)
+        self.dig_H1 = b[25]
+        e = bytes(self.bus.read_i2c_block_data(self.addr, 0xE1, 7))
+        self.dig_H2 = struct.unpack_from("<h", e, 0)[0]
+        self.dig_H3 = e[2]
+        h4 = (e[3] << 4) | (e[4] & 0x0F)
+        h5 = (e[5] << 4) | (e[4] >> 4)
+        self.dig_H4 = h4 - 0x1000 if h4 & 0x800 else h4
+        self.dig_H5 = h5 - 0x1000 if h5 & 0x800 else h5
+        self.dig_H6 = struct.unpack_from("<b", e, 6)[0]
+
+    def read(self):
+        r = self.bus.read_i2c_block_data(self.addr, self.REG_DATA, 8)
+        up = (r[0] << 12) | (r[1] << 4) | (r[2] >> 4)
+        ut = (r[3] << 12) | (r[4] << 4) | (r[5] >> 4)
+        uh = (r[6] << 8) | r[7]
+        T1, T2, T3 = self.dig_T
+        P1, P2, P3, P4, P5, P6, P7, P8, P9 = self.dig_P
+
+        x1 = (ut / 16384.0 - T1 / 1024.0) * T2
+        x2 = (ut / 131072.0 - T1 / 8192.0) ** 2 * T3
+        t_fine = x1 + x2
+        temp = t_fine / 5120.0
+
+        x1 = t_fine / 2.0 - 64000.0
+        x2 = x1 * x1 * P6 / 32768.0 + x1 * P5 * 2.0
+        x2 = x2 / 4.0 + P4 * 65536.0
+        x1 = (P3 * x1 * x1 / 524288.0 + P2 * x1) / 524288.0
+        x1 = (1.0 + x1 / 32768.0) * P1
+        if x1 == 0.0:
+            press = float("nan")
+        else:
+            p = 1048576.0 - up
+            p = (p - x2 / 4096.0) * 6250.0 / x1
+            x1 = P9 * p * p / 2147483648.0
+            x2 = p * P8 / 32768.0
+            press = (p + (x1 + x2 + P7) / 16.0) / 100.0   # hPa
+
+        h = t_fine - 76800.0
+        h = (uh - (self.dig_H4 * 64.0 + self.dig_H5 / 16384.0 * h)) * \
+            (self.dig_H2 / 65536.0 * (1.0 + self.dig_H6 / 67108864.0 * h *
+                                       (1.0 + self.dig_H3 / 67108864.0 * h)))
+        h *= 1.0 - self.dig_H1 * h / 524288.0
+        hum = min(max(h, 0.0), 100.0)
+        return temp, press, hum
+
+    def sample(self, seconds, hz=20):
+        T, P, H = [], [], []
+        end = time.time() + seconds
+        while time.time() < end:
+            t, p, h = self.read()
+            T.append(t); P.append(p); H.append(h)
+            time.sleep(1.0 / hz)
+        return T, P, H
+
+
+def p2alt(p_hpa, p0=1013.25):
+    return 44330.0 * (1.0 - (p_hpa / p0) ** 0.190295)
+
+
+def test_bme280(bus, rep, auto, secs):
+    rep.section("BME280  気圧・気温・湿度")
+    s = BME280(bus)
+    rep.judge("BME280", "chip_id", True, f"0x60 @ 0x{s.addr:02X}")
+
+    T, P, H = s.sample(secs)
+    rep.judge("BME280", "気温", -40 <= mean(T) <= 85, f"{mean(T):.2f} ℃ (σ {sd(T):.3f})")
+    rep.judge("BME280", "気圧", 300 <= mean(P) <= 1100, f"{mean(P):.2f} hPa")
+    # 仕様上の分解能 0.18Pa (IIR=16時) → 静止ノイズはおおむね数Pa。0.1hPa超えは異常と判断
+    rep.judge("BME280", "気圧ノイズ(静止)", sd(P) < 0.10,
+              f"σ {sd(P) * 100:.2f} Pa  (高度換算 σ {sd(P) * 100 / 12.0:.2f} m)")
+    rep.judge("BME280", "湿度", 0 < mean(H) < 100, f"{mean(H):.1f} %RH")
+    rep.judge("BME280", "推定高度", None, f"{p2alt(mean(P)):.1f} m (海面1013.25hPa仮定)")
+
+    if ask(rep, "【持ち上げ試験】機体を床(または机)に置いてください", auto):
+        _, P0, _ = s.sample(3)
+        if ask(rep, "機体を そのまま約1m 真上に持ち上げて静止させてください", auto):
+            _, P1, _ = s.sample(3)
+            dh = p2alt(mean(P1)) - p2alt(mean(P0))
+            rep.judge("BME280", "1m持ち上げ時の高度変化", 0.4 <= dh <= 1.8,
+                      f"{dh:+.2f} m  (Δp {(mean(P1) - mean(P0)) * 100:+.1f} Pa, 期待値 約-12Pa)")
+
+
+# =====================================================================
+# BNO055  (Bosch BST-BNO055-DS000, Page0 レジスタマップ)
+# =====================================================================
+class BNO055:
+    CHIP_ID, ST_RESULT, CALIB_STAT = 0x00, 0x36, 0x35
+    SYS_STATUS, SYS_ERR, UNIT_SEL = 0x39, 0x3A, 0x3B
+    OPR_MODE, PWR_MODE, SYS_TRIGGER, PAGE_ID = 0x3D, 0x3E, 0x3F, 0x07
+    ACC, GYR, EUL, LIA, GRV = 0x08, 0x14, 0x1A, 0x28, 0x2E
+    TEMP = 0x34
+
+    def __init__(self, bus, addr=0x28):
+        self.bus, self.addr = bus, addr
+        t0 = time.time()
+        while True:   # POR後 約650msはI2C応答しない (データシート 1.2)
+            try:
+                if self._r(self.CHIP_ID) == 0xA0:
+                    break
+            except OSError:
+                pass
+            if time.time() - t0 > 1.5:
+                raise RuntimeError("CHIP_ID 0xA0 を読めない (0x28)")
+            time.sleep(0.05)
+        self._w(self.PAGE_ID, 0)
+        self._w(self.OPR_MODE, 0x00); time.sleep(0.025)    # CONFIGMODE (切替19ms)
+        self._w(self.SYS_TRIGGER, 0x01)                     # 自己診断(BIST)を実行
+        time.sleep(0.5)
+        self.st = self._r(self.ST_RESULT)
+        self._w(self.PWR_MODE, 0x00)                        # Normal
+        self._w(self.UNIT_SEL, 0x00)                        # m/s², dps, deg, ℃, Windows向き
+        self._w(self.OPR_MODE, 0x0C); time.sleep(0.02)      # NDOF (切替7ms)
+        time.sleep(0.3)
+
+    def _r(self, reg):
+        return self.bus.read_byte_data(self.addr, reg)
+
+    def _w(self, reg, v):
+        self.bus.write_byte_data(self.addr, reg, v)
+
+    def _v3(self, reg, lsb):
+        x, y, z = struct.unpack("<hhh", bytes(self.bus.read_i2c_block_data(self.addr, reg, 6)))
+        return (x / lsb, y / lsb, z / lsb)
+
+    def acc(self):  return self._v3(self.ACC, 100.0)   # 1 m/s² = 100 LSB
+    def gyr(self):  return self._v3(self.GYR, 16.0)    # 1 dps  = 16 LSB
+    def eul(self):  return self._v3(self.EUL, 16.0)    # heading, roll, pitch (1° = 16 LSB)
+    def grv(self):  return self._v3(self.GRV, 100.0)
+    def lia(self):  return self._v3(self.LIA, 100.0)
+
+    def calib(self):
+        c = self._r(self.CALIB_STAT)
+        return (c >> 6) & 3, (c >> 4) & 3, (c >> 2) & 3, c & 3   # sys, gyr, acc, mag
+
+    def status(self):
+        return self._r(self.SYS_STATUS), self._r(self.SYS_ERR)
+
+    def avg_vec(self, fn, seconds, hz=50):
+        xs = []
+        end = time.time() + seconds
+        while time.time() < end:
+            xs.append(fn())
+            time.sleep(1.0 / hz)
+        return tuple(mean([v[i] for v in xs]) for i in range(3)), xs
+
+
+def norm(v):
+    return math.sqrt(sum(a * a for a in v))
+
+
+def angle_between(a, b):
+    c = sum(x * y for x, y in zip(a, b)) / (norm(a) * norm(b))
+    return math.degrees(math.acos(max(-1.0, min(1.0, c))))
+
+
+def circular_mean_deg(xs):
+    s = sum(math.sin(math.radians(x)) for x in xs)
+    c = sum(math.cos(math.radians(x)) for x in xs)
+    return math.degrees(math.atan2(s, c)) % 360
+
+
+def heading_avg(s, seconds=1.0):
+    xs = []
+    end = time.time() + seconds
+    while time.time() < end:
+        xs.append(s.eul()[0])
+        time.sleep(0.05)
+    return circular_mean_deg(xs)
+
+
+def test_bno055(bus, rep, auto, secs):
+    rep.section("BNO055  9軸IMU   ※静的試験は机の上で静止させて実施")
+    s = BNO055(bus)
+    names = ("加速度", "地磁気", "ジャイロ", "MCU")
+    ng = [names[i] for i in range(4) if not (s.st >> i) & 1]
+    rep.judge("BNO055", "自己診断 ST_RESULT", not ng,
+              f"0x{s.st:02X} " + ("全項目合格" if not ng else "失敗: " + ",".join(ng)))
+
+    a_mean, a_all = s.avg_vec(s.acc, secs)
+    g_mean, g_all = s.avg_vec(s.gyr, 1.0)
+    sys_st, sys_err = s.status()
+    rep.judge("BNO055", "SYS_STATUS", sys_st == 5,
+              f"{sys_st} (5=フュージョン動作中)  SYS_ERR={sys_err} (0=エラーなし)")
+    amag = [norm(v) for v in a_all]
+    rep.judge("BNO055", "静止時の |加速度|", abs(mean(amag) - G0) < 0.4,
+              f"{mean(amag):.3f} m/s² (σ {sd(amag):.3f}, 期待 9.81)")
+    gmag = [norm(v) for v in g_all]
+    rep.judge("BNO055", "静止時の |角速度|", mean(gmag) < 1.5, f"{mean(gmag):.3f} dps (期待 ≒0)")
+    h, r, p = s.eul()
+    rep.judge("BNO055", "オイラー角", None, f"Heading {h:.1f}°  Roll {r:.1f}°  Pitch {p:.1f}°")
+    rep.judge("BNO055", "内部温度", None, f"{struct.unpack('<b', bytes([s._r(s.TEMP)]))[0]} ℃")
+
+    if ask(rep, "【キャリブ】機体を空中でゆっくり8の字に20秒ほど振り、"
+                "その後いくつかの向きで数秒ずつ静止させてください (Enterで計測開始)", auto):
+        end = time.time() + 30
+        while time.time() < end:
+            c = s.calib()
+            print(f"\r      sys/gyr/acc/mag = {c[0]}/{c[1]}/{c[2]}/{c[3]}  残り{end - time.time():4.0f}s ", end="")
+            if c[1] == 3 and c[3] == 3 and c[0] >= 2:
+                break
+            time.sleep(0.5)
+        print()
+    c = s.calib()
+    rep.judge("BNO055", "キャリブ sys/gyr/acc/mag", None if auto else (c[1] == 3 and c[3] >= 2),
+              f"{c[0]}/{c[1]}/{c[2]}/{c[3]} (各3が満点)")
+
+    if ask(rep, "【傾け試験】機体を水平な面に置いてください", auto):
+        g0, _ = s.avg_vec(s.grv, 1.5)
+        if ask(rep, "機体を 横に90° 倒して(側面を下にして)静止させてください", auto):
+            g1, _ = s.avg_vec(s.grv, 1.5)
+            ang = angle_between(g0, g1)
+            rep.judge("BNO055", "90°傾け時の重力ベクトル変化", 80 <= ang <= 100, f"{ang:.1f}° (期待 90°)")
+
+    if ask(rep, "【旋回試験】機体を水平に置き、向きを覚えておいてください", auto):
+        h0 = heading_avg(s)
+        if ask(rep, "水平のまま 時計回りに90° 回して静止させてください", auto):
+            h1 = heading_avg(s)
+            dh = (h1 - h0 + 540) % 360 - 180
+            rep.judge("BNO055", "90°旋回時のHeading変化", 75 <= abs(dh) <= 105,
+                      f"{dh:+.1f}° (期待 ±90°, 地磁気キャリブ不足だとずれる)")
+
+
+# =====================================================================
+# VL53L1X  (adafruit-circuitpython-vl53l1x : distance は cm, 無効時 None)
+# =====================================================================
+class ToF:
+    def __init__(self):
+        import board
+        import busio
+        import adafruit_vl53l1x
+        self.dev = adafruit_vl53l1x.VL53L1X(busio.I2C(board.SCL, board.SDA), address=0x29)
+        self.model = self.dev.model_info
+        self.dev.distance_mode = 2      # long: 最大 約4m (暗所)
+        self.dev.timing_budget = 100    # ms
+        self.dev.start_ranging()
+
+    def sample(self, seconds):
+        good, bad = [], 0
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.dev.data_ready:
+                d = self.dev.distance
+                self.dev.clear_interrupt()
+                if d is None:
+                    bad += 1
+                else:
+                    good.append(d)
+            time.sleep(0.005)
+        return good, bad
+
+    def close(self):
+        self.dev.stop_ranging()
+
+
+def test_tof(rep, auto, secs, refs):
+    rep.section("VL53L1X  ToF距離")
+    s = ToF()
+    try:
+        m = s.model
+        rep.judge("VL53L1X", "Model ID", m[0] == 0xEA and m[1] == 0xCC,
+                  f"model 0x{m[0]:02X} / type 0x{m[1]:02X} (期待 0xEA / 0xCC)")
+        good, bad = s.sample(secs)
+        n = len(good) + bad
+        rep.judge("VL53L1X", "測定レート", n >= secs * 7, f"{n / secs:.1f} Hz (timing budget 100ms → 約10Hz)")
+        if good:
+            rep.judge("VL53L1X", "現在の距離", None,
+                      f"{mean(good):.1f} cm (σ {sd(good):.2f}, 無効 {bad}/{n})")
+        else:
+            rep.judge("VL53L1X", "現在の距離", None, "有効値なし (前方4m以内に物体がない?)")
+
+        for ref in refs:
+            if not ask(rep, f"【距離試験】センサ正面 {ref:g} cm に板(白い紙など)を置いてください", auto):
+                continue
+            good, bad = s.sample(2.0)
+            if not good:
+                rep.judge("VL53L1X", f"{ref:g}cm", False, f"有効値なし (無効 {bad})")
+                continue
+            err = mean(good) - ref
+            # 仕様上の精度 ±20mm 程度 → 板の置き誤差も見込んで max(3cm, 5%)
+            rep.judge("VL53L1X", f"{ref:g}cm 計測", abs(err) <= max(3.0, ref * 0.05),
+                      f"{mean(good):.1f} cm  誤差 {err:+.1f} cm  σ {sd(good):.2f}  無効 {bad}")
+    finally:
+        s.close()
+
+
+# =====================================================================
+# SAM-M10Q  (u-blox M10 Interface description: UBX プロトコル over I2C)
+#   読み: 0xFD/0xFE = 送信待ちバイト数, 0xFF = データストリーム
+#   書き: UBXフレームをそのまま書き込む(レジスタアドレスなし)
+# =====================================================================
+class UbloxI2C:
+    def __init__(self, bus, addr=0x42):
+        self.bus, self.addr = bus, addr
+        self.rx = bytearray()
+
+    @staticmethod
+    def frame(cls, mid, payload=b""):
+        body = bytes([cls, mid]) + struct.pack("<H", len(payload)) + payload
+        a = b = 0
+        for x in body:
+            a = (a + x) & 0xFF
+            b = (b + a) & 0xFF
+        return b"\xB5\x62" + body + bytes([a, b])
+
+    def send(self, cls, mid, payload=b""):
+        self.bus.i2c_rdwr(i2c_msg.write(self.addr, list(self.frame(cls, mid, payload))))
+
+    def _pull(self):
+        hi, lo = self.bus.read_i2c_block_data(self.addr, 0xFD, 2)
+        n = (hi << 8) | lo
+        if n in (0, 0xFFFF):
+            return
+        while n > 0:
+            k = min(n, 128)
+            rd = i2c_msg.read(self.addr, k)
+            self.bus.i2c_rdwr(i2c_msg.write(self.addr, [0xFF]), rd)
+            self.rx += bytes(rd)
+            n -= k
+
+    def messages(self):
+        """受信バッファからUBXメッセージを取り出す (NMEA等は読み捨て)"""
+        self._pull()
+        out = []
+        while True:
+            i = self.rx.find(b"\xB5\x62")
+            if i < 0:
+                self.rx = self.rx[-1:]
+                break
+            del self.rx[:i]
+            if len(self.rx) < 8:
+                break
+            ln = struct.unpack_from("<H", self.rx, 4)[0]
+            if ln > 1024:
+                del self.rx[:2]
+                continue
+            if len(self.rx) < 8 + ln:
+                break
+            pkt = bytes(self.rx[:8 + ln])
+            del self.rx[:8 + ln]
+            if self.frame(pkt[2], pkt[3], pkt[6:6 + ln]) == pkt:
+                out.append((pkt[2], pkt[3], pkt[6:6 + ln]))
+            else:
+                self.bad = getattr(self, "bad", 0) + 1
+        return out
+
+    def poll(self, cls, mid, timeout=1.5):
+        self.send(cls, mid)
+        end = time.time() + timeout
+        while time.time() < end:
+            for c, m, p in self.messages():
+                if c == cls and m == mid:
+                    return p
+            time.sleep(0.05)
+        return None
+
+
+NAV_PVT = struct.Struct("<IHBBBBBBIiBBBBiiiiIIiiiiiIIH")   # 先頭78バイト
+
+
+def parse_pvt(p):
+    f = NAV_PVT.unpack_from(p, 0)
+    return {
+        "utc": f"{f[1]:04d}-{f[2]:02d}-{f[3]:02d} {f[4]:02d}:{f[5]:02d}:{f[6]:02d}",
+        "fix_type": f[10], "fix_ok": bool(f[11] & 0x01), "num_sv": f[13],
+        "lon": f[14] * 1e-7, "lat": f[15] * 1e-7, "h_msl": f[17] / 1000.0,
+        "h_acc": f[18] / 1000.0, "v_acc": f[19] / 1000.0,
+        "g_speed": f[23] / 1000.0, "pdop": f[27] * 0.01,
+    }
+
+
+FIX_NAME = {0: "なし", 1: "DRのみ", 2: "2D", 3: "3D", 4: "GNSS+DR", 5: "時刻のみ"}
+
+
+def test_gnss(bus, rep, timeout):
+    rep.section("SAM-M10Q  GNSS   ※Fixは屋外・上空が開けた場所で")
+    g = UbloxI2C(bus)
+    ver = g.poll(0x0A, 0x04, timeout=2.0)   # UBX-MON-VER
+    if ver is None:
+        rep.judge("GNSS", "UBX通信 (MON-VER)", False, "応答なし (0x42 の配線/電源を確認)")
+        return
+    sw = ver[0:30].split(b"\0")[0].decode(errors="ignore")
+    hw = ver[30:40].split(b"\0")[0].decode(errors="ignore")
+    ext = [ver[i:i + 30].split(b"\0")[0].decode(errors="ignore") for i in range(40, len(ver), 30)]
+    rep.judge("GNSS", "UBX通信 (MON-VER)", True, f"SW {sw} / HW {hw}")
+    for e in ext:
+        if e.startswith(("FWVER", "PROTVER", "MOD")):
+            rep.judge("GNSS", "  ", None, e)
+
+    t0 = time.time()
+    last = None
+    first_fix = None
+    while time.time() - t0 < timeout:
+        p = g.poll(0x01, 0x07, timeout=1.5)  # UBX-NAV-PVT
+        if p and len(p) >= NAV_PVT.size:
+            last = parse_pvt(p)
+            el = time.time() - t0
+            print(f"\r      {el:5.0f}s  Fix {FIX_NAME.get(last['fix_type'], '?'):<4s} "
+                  f"衛星 {last['num_sv']:2d}  水平精度 {last['h_acc']:7.1f} m   ", end="")
+            if last["fix_ok"] and last["fix_type"] == 3:
+                first_fix = el
+                break
+        time.sleep(1.0)
+    print()
+
+    if last is None:
+        rep.judge("GNSS", "NAV-PVT 取得", False, "NAV-PVTの応答なし")
+        return
+    rep.judge("GNSS", "NAV-PVT 取得", True, f"UTC {last['utc']}")
+    rep.judge("GNSS", "3D Fix", first_fix is not None,
+              f"{first_fix:.0f} 秒で取得" if first_fix is not None
+              else f"{timeout:.0f} 秒以内に未取得 (現在 {FIX_NAME.get(last['fix_type'], '?')})")
+    rep.judge("GNSS", "使用衛星数", last["num_sv"] >= 6 if first_fix else None, f"{last['num_sv']}")
+    if first_fix is not None:
+        rep.judge("GNSS", "水平精度 hAcc", last["h_acc"] < 5.0, f"{last['h_acc']:.1f} m")
+        rep.judge("GNSS", "PDOP", last["pdop"] < 3.0, f"{last['pdop']:.2f}")
+        rep.judge("GNSS", "位置", None,
+                  f"{last['lat']:.7f}, {last['lon']:.7f}  標高 {last['h_msl']:.1f} m")
+    if getattr(g, "bad", 0):
+        rep.judge("GNSS", "UBXチェックサム異常", False, f"{g.bad} 件 (I2C読み取りの取りこぼし)")
+
+
+# =====================================================================
+# I2C スキャン
+# =====================================================================
+EXPECT = {0x28: "BNO055", 0x29: "VL53L1X", 0x30: "IM920-HAT", 0x42: "SAM-M10Q", 0x77: "BME280"}
+
+
+def scan(bus, rep):
+    rep.section("I2C スキャン (bus 1)")
+    found = []
+    for a in range(0x08, 0x78):
+        try:
+            # i2cdetect と同じ方式: 0x30-0x37, 0x50-0x5F は読み出し, それ以外はクイック書き込み
+            if 0x30 <= a <= 0x37 or 0x50 <= a <= 0x5F:
+                bus.read_byte(a)
+            else:
+                bus.write_quick(a)
+            found.append(a)
+        except OSError:
+            pass
+    rep.log("  検出: " + (" ".join(f"0x{a:02X}" for a in found) or "なし"))
+    for a, n in EXPECT.items():
+        hit = a in found or (a == 0x77 and 0x76 in found)
+        rep.judge("I2C", f"0x{a:02X} {n}", hit, "応答あり" if hit else "応答なし")
+    return found
+
+
+# =====================================================================
+# 連続モニタ
+# =====================================================================
+def monitor(bus, targets, rate, csv_path):
+    bme = bno = tof = gn = None
+    if "bme280" in targets:
+        try: bme = BME280(bus)
+        except Exception as e: print("BME280 初期化失敗:", e)
+    if "bno055" in targets:
+        try: bno = BNO055(bus)
+        except Exception as e: print("BNO055 初期化失敗:", e)
+    if "tof" in targets:
+        try: tof = ToF(); tof.dev.timing_budget = 50
+        except Exception as e: print("VL53L1X 初期化失敗:", e)
+    if "gnss" in targets:
+        gn = UbloxI2C(bus)
+
+    keys = ["time_s", "temp_C", "press_hPa", "alt_m", "hum_pct",
+            "heading", "roll", "pitch", "ax", "ay", "az", "gx", "gy", "gz",
+            "lin_ax", "lin_ay", "lin_az", "calib",
+            "tof_cm", "fix_type", "num_sv", "lat", "lon", "h_msl", "h_acc"]
+    fp = open(csv_path, "w", newline="", encoding="utf-8") if csv_path else None
+    wr = csv.DictWriter(fp, fieldnames=keys) if fp else None
+    if wr:
+        wr.writeheader()
+
+    t0 = time.time()
+    tof_cm = None
+    gn_last = {}
+    gn_next = 0.0
+    print("Ctrl+C で終了")
+    try:
+        while True:
+            ts = time.time()
+            row = {"time_s": round(ts - t0, 3)}
+            out = [f"{row['time_s']:8.2f}"]
+            try:
+                if bme:
+                    t, p, h = bme.read()
+                    row.update(temp_C=round(t, 2), press_hPa=round(p, 3),
+                               alt_m=round(p2alt(p), 2), hum_pct=round(h, 1))
+                    out.append(f"{t:5.1f}℃ {p:8.2f}hPa")
+                if bno:
+                    e, a, gy, la, c = bno.eul(), bno.acc(), bno.gyr(), bno.lia(), bno.calib()
+                    row.update(heading=e[0], roll=e[1], pitch=e[2],
+                               ax=a[0], ay=a[1], az=a[2], gx=gy[0], gy=gy[1], gz=gy[2],
+                               lin_ax=la[0], lin_ay=la[1], lin_az=la[2], calib="".join(map(str, c)))
+                    out.append(f"H{e[0]:6.1f} R{e[1]:6.1f} P{e[2]:6.1f} cal{''.join(map(str, c))}")
+                if tof:
+                    if tof.dev.data_ready:
+                        tof_cm = tof.dev.distance
+                        tof.dev.clear_interrupt()
+                    row["tof_cm"] = tof_cm
+                    out.append(f"ToF {tof_cm if tof_cm is not None else '---':>6} cm")
+                if gn:
+                    if ts >= gn_next:   # NAV-PVTは1Hzで十分
+                        gn_next = ts + 1.0
+                        pv = gn.poll(0x01, 0x07, timeout=0.3)
+                        if pv and len(pv) >= NAV_PVT.size:
+                            gn_last = parse_pvt(pv)
+                    if gn_last:
+                        row.update({k: gn_last[k] for k in ("fix_type", "num_sv", "lat", "lon", "h_msl", "h_acc")})
+                        out.append(f"GNSS {FIX_NAME.get(gn_last['fix_type'], '?')} sv{gn_last['num_sv']}")
+            except OSError as ex:
+                out.append(f"I2Cエラー: {ex}")
+            print(" | ".join(out))
+            if wr:
+                wr.writerow(row)
+                fp.flush()
+            time.sleep(max(0.0, 1.0 / rate - (time.time() - ts)))
+    except KeyboardInterrupt:
+        print("\n終了")
+    finally:
+        if tof:
+            tof.close()
+        if fp:
+            fp.close()
+            print("CSV保存:", csv_path)
+
+
+# =====================================================================
+# main
+# =====================================================================
+def main():
+    ap = argparse.ArgumentParser(description="CanSat センサ試験")
+    ap.add_argument("--only", default="bme280,bno055,tof,gnss", help="bme280,bno055,tof,gnss")
+    ap.add_argument("--auto", action="store_true", help="動的試験(操作が必要なもの)を飛ばす")
+    ap.add_argument("--secs", type=float, default=5.0, help="静的試験の計測秒数")
+    ap.add_argument("--tof-refs", default="20,50,100", help="ToF距離試験の基準距離[cm] (カンマ区切り)")
+    ap.add_argument("--gnss-timeout", type=float, default=60.0, help="GNSS 3D Fixを待つ最大秒数")
+    ap.add_argument("--monitor", action="store_true", help="試験ではなく連続表示モード")
+    ap.add_argument("--rate", type=float, default=5.0, help="モニタ表示レート[Hz]")
+    ap.add_argument("--csv", default=None, help="モニタ時のCSV保存先")
+    ap.add_argument("--no-report", action="store_true", help="レポートファイルを作らない")
+    a = ap.parse_args()
+    targets = {x.strip().lower() for x in a.only.split(",") if x.strip()}
+
+    with SMBus(BUS_NO) as bus:
+        if a.monitor:
+            monitor(bus, targets, a.rate, a.csv)
+            return 0
+
+        path = None if a.no_report else dt.datetime.now().strftime("report_%Y%m%d_%H%M%S.txt")
+        rep = Report(path)
+        rep.log(f"CanSat センサ試験  {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
+        rep.log(f"対象: {', '.join(sorted(targets))}   動的試験: {'なし' if a.auto else 'あり'}")
+
+        scan(bus, rep)
+
+        tests = [
+            ("bme280", lambda: test_bme280(bus, rep, a.auto, a.secs)),
+            ("bno055", lambda: test_bno055(bus, rep, a.auto, a.secs)),
+            ("tof", lambda: test_tof(rep, a.auto, a.secs,
+                                     [float(x) for x in a.tof_refs.split(",") if x.strip()])),
+            ("gnss", lambda: test_gnss(bus, rep, a.gnss_timeout)),
+        ]
+        for key, fn in tests:
+            if key not in targets:
+                continue
+            try:
+                fn()
+            except ImportError as e:
+                rep.judge(key, "ライブラリ", False, f"{e}  → venv を有効化したか確認")
+            except OSError as e:
+                rep.judge(key, "I2C通信", False, str(e))
+                if key == "bno055":
+                    rep.log("    ヒント: BNO055はI2Cクロックストレッチを使うため、Piでは"
+                            " /boot/firmware/config.txt に dtparam=i2c_arm_baudrate=10000 を追加すると安定することが多い")
+            except Exception as e:
+                rep.judge(key, "試験中断", False, f"{type(e).__name__}: {e}")
+
+        rep.section("まとめ")
+        sensors = []
+        for s, _, _ in rep.summary:
+            if s not in sensors:
+                sensors.append(s)
+        all_ok = True
+        for s in sensors:
+            r = [ok for ss, _, ok in rep.summary if ss == s and ok is not None]
+            ng = [it for ss, it, ok in rep.summary if ss == s and ok is False]
+            if ng:
+                all_ok = False
+            rep.log(f"  {s:<8s} 合格 {r.count(True)}/{len(r)}" + (f"   不合格: {', '.join(ng)}" if ng else ""))
+        rep.log("\n  総合判定: " + ("合格" if all_ok else "不合格あり"))
+        if path:
+            rep.log(f"  レポート: {path}")
+        rep.close()
+        return 0 if all_ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
